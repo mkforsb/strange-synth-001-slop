@@ -1,0 +1,11 @@
+[package]
+name = "sa-worklet"
+version = "0.1.0"
+edition = "2024"
+description = "Bare wasm module (no wasm-bindgen) that runs the engine inside an AudioWorklet"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+sa-engine = { path = "../engine" }

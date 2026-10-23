@@ -1,0 +1,66 @@
+[package]
+name = "strange-attractor"
+version = "0.1.0"
+edition = "2024"
+description = "A very strange synthesizer for the web"
+build = "build.rs"
+
+[dependencies]
+dioxus = { version = "0.7", features = ["web"] }
+sa-engine = { path = "crates/engine" }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "AudioContext",
+    "AudioContextOptions",
+    "AudioContextState",
+    "AudioDestinationNode",
+    "AudioNode",
+    "AudioParam",
+    "AudioWorklet",
+    "AudioWorkletNode",
+    "AudioWorkletNodeOptions",
+    "AnalyserNode",
+    "BaseAudioContext",
+    "Blob",
+    "BlobPropertyBag",
+    "CanvasRenderingContext2d",
+    "ChannelSplitterNode",
+    "CssStyleDeclaration",
+    "Document",
+    "DomRect",
+    "Element",
+    "EventTarget",
+    "GainNode",
+    "HtmlCanvasElement",
+    "HtmlElement",
+    "KeyboardEvent",
+    "MessageEvent",
+    "MessagePort",
+    "Navigator",
+    "PointerEvent",
+    "Storage",
+    "Url",
+    "Window",
+    "Worklet",
+] }
+
+[workspace]
+members = ["crates/engine", "crates/worklet"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.wasm-dev]
+inherits = "dev"
+opt-level = 1
+
+[profile.server-dev]
+inherits = "dev"
+
+[profile.android-dev]
+inherits = "dev"
