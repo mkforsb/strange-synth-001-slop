@@ -7,17 +7,18 @@
 //!                                          └─► analyser mix               (spectrogram)
 //! ```
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use dioxus::prelude::*;
-use js_sys::{Array, Float32Array, Object, Reflect, Uint8Array};
+use js_sys::{Array, Float32Array, Object, Reflect, Uint8Array, WebAssembly};
 use sa_engine::engine::TELEMETRY_LEN;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    AnalyserNode, AudioContext, AudioWorkletNode, AudioWorkletNodeOptions, Blob, BlobPropertyBag, GainNode,
-    MessageEvent, MessagePort, Url,
+    AnalyserNode, AudioContext, AudioContextState, AudioWorkletNode, AudioWorkletNodeOptions, Blob, BlobPropertyBag,
+    GainNode, MessageEvent, MessagePort, Url,
 };
 
 static WORKLET_JS: &str = include_str!("../assets/worklet.js");
@@ -27,7 +28,12 @@ static DSP_WASM: &[u8] = include_bytes!(env!("DSP_WASM"));
 pub enum AudioStatus {
     Off,
     Starting,
-    Running { sample_rate: f32 },
+    /// Worklet is up but the browser holds the context suspended until a
+    /// gesture it accepts.
+    Suspended,
+    Running {
+        sample_rate: f32,
+    },
     Failed(String),
 }
 
@@ -40,6 +46,7 @@ pub struct Audio {
     pub analyser_mix: AnalyserNode,
     _node: AudioWorkletNode,
     _on_message: Closure<dyn FnMut(MessageEvent)>,
+    _on_state: Closure<dyn FnMut()>,
 }
 
 thread_local! {
@@ -99,21 +106,70 @@ pub fn set_volume(gain: f32) {
     with_audio(|a| a.master.gain().set_target_at_time(gain, a.ctx.current_time(), 0.02));
 }
 
-/// Boot the audio graph. Must be called from a user gesture.
-pub async fn start(patch: Vec<f32>, volume: f32, mut status: Signal<AudioStatus>) {
-    if is_running() {
+/// Boot the audio graph, or resume it if it is already up.
+///
+/// Must be called synchronously from a user-gesture handler (not from a task
+/// spawned by one): mobile browsers, Firefox on Android in particular, only let
+/// an `AudioContext` start if it is created/resumed inside the gesture itself.
+pub fn start(patch: Vec<f32>, volume: f32, mut status: Signal<AudioStatus>) {
+    if with_audio(|a| a.ctx.resume()).is_some() || *status.peek() == AudioStatus::Starting {
         return;
     }
+    let ctx = match AudioContext::new() {
+        Ok(ctx) => ctx,
+        Err(e) => return status.set(AudioStatus::Failed(js_error(&e))),
+    };
+    let _ = ctx.resume();
     status.set(AudioStatus::Starting);
-    if let Err(e) = start_inner(patch, volume, status).await {
-        let text = e.as_string().unwrap_or_else(|| format!("{e:?}"));
-        status.set(AudioStatus::Failed(text));
+    spawn(async move {
+        if let Err(e) = start_inner(ctx, patch, volume, status).await {
+            status.set(AudioStatus::Failed(js_error(&e)));
+        }
+    });
+}
+
+/// Resume a context the browser suspended (autoplay policy, app backgrounded,
+/// ...). Installed on window-level gesture events by [`install_gesture_resume`].
+fn resume_if_suspended() {
+    with_audio(|a| {
+        if a.ctx.state() != AudioContextState::Running {
+            let _ = a.ctx.resume();
+        }
+    });
+}
+
+/// Every later tap or key press gets a chance to (re)start a suspended context.
+pub fn install_gesture_resume() {
+    let Some(window) = web_sys::window() else { return };
+    let cb = Closure::<dyn FnMut()>::new(resume_if_suspended);
+    for ev in ["pointerup", "touchend", "click", "keydown"] {
+        let _ = window.add_event_listener_with_callback(ev, cb.as_ref().unchecked_ref());
+    }
+    cb.forget();
+}
+
+fn js_error(e: &JsValue) -> String {
+    if let Some(err) = e.dyn_ref::<js_sys::Error>() {
+        return String::from(err.message());
+    }
+    e.as_string().unwrap_or_else(|| format!("{e:?}"))
+}
+
+/// Status to show once the worklet is up: the context may still be held
+/// suspended by the browser until a gesture it accepts.
+fn live_status(ctx: &AudioContext) -> AudioStatus {
+    match ctx.state() {
+        AudioContextState::Running => AudioStatus::Running { sample_rate: ctx.sample_rate() },
+        _ => AudioStatus::Suspended,
     }
 }
 
-async fn start_inner(patch: Vec<f32>, volume: f32, mut status: Signal<AudioStatus>) -> Result<(), JsValue> {
-    let ctx = AudioContext::new()?;
-
+async fn start_inner(
+    ctx: AudioContext,
+    patch: Vec<f32>,
+    volume: f32,
+    mut status: Signal<AudioStatus>,
+) -> Result<(), JsValue> {
     let props = BlobPropertyBag::new();
     props.set_type("application/javascript");
     let blob = Blob::new_with_str_sequence_and_options(&Array::of1(&WORKLET_JS.into()), &props)?;
@@ -121,13 +177,34 @@ async fn start_inner(patch: Vec<f32>, volume: f32, mut status: Signal<AudioStatu
     JsFuture::from(ctx.audio_worklet()?.add_module(&url)?).await?;
     Url::revoke_object_url(&url)?;
 
+    // Compile the DSP here and hand the module to the worklet, which then
+    // instantiates it synchronously in its constructor; no promise jobs needed
+    // on the audio thread (which may not run them while the context is suspended).
+    let bytes = Uint8Array::from(DSP_WASM);
+    let module = JsFuture::from(WebAssembly::compile(&bytes.buffer().into())).await?;
+    let processor_options = Object::new();
+    Reflect::set(&processor_options, &"module".into(), &module)?;
+
     let opts = AudioWorkletNodeOptions::new();
     opts.set_number_of_inputs(0);
     opts.set_number_of_outputs(1);
     opts.set_output_channel_count(&Array::of1(&2.into()));
+    opts.set_processor_options(Some(&processor_options));
     let node = AudioWorkletNode::new_with_options(&ctx, "strange-attractor", &opts)?;
     let port = node.port()?;
 
+    let ready = Rc::new(Cell::new(false));
+    let on_state = {
+        let (ctx, ready) = (ctx.clone(), ready.clone());
+        Closure::<dyn FnMut()>::new(move || {
+            if ready.get() {
+                status.set(live_status(&ctx));
+            }
+        })
+    };
+    ctx.set_onstatechange(Some(on_state.as_ref().unchecked_ref()));
+
+    let ctx_msg = ctx.clone();
     let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |ev: MessageEvent| {
         let data = ev.data();
         let kind = Reflect::get(&data, &"t".into()).ok().and_then(|t| t.as_string()).unwrap_or_default();
@@ -143,8 +220,8 @@ async fn start_inner(patch: Vec<f32>, volume: f32, mut status: Signal<AudioStatu
                 }
             }
             "ready" => {
-                let sr = Reflect::get(&data, &"sampleRate".into()).ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
-                status.set(AudioStatus::Running { sample_rate: sr as f32 });
+                ready.set(true);
+                status.set(live_status(&ctx_msg));
             }
             "error" => {
                 let m = Reflect::get(&data, &"msg".into()).ok().and_then(|v| v.as_string()).unwrap_or_default();
@@ -176,12 +253,11 @@ async fn start_inner(patch: Vec<f32>, volume: f32, mut status: Signal<AudioStatu
     analyser_mix.set_max_decibels(-10.0);
     master.connect_with_audio_node(&analyser_mix)?;
 
-    // Hand the DSP module to the worklet (a copy; the worklet compiles it).
-    let bytes = Uint8Array::from(DSP_WASM);
-    port.post_message(&msg(&[("t", "wasm".into()), ("bytes", bytes.buffer().into())]))?;
     port.post_message(&msg(&[("t", "patch".into()), ("values", Float32Array::from(patch.as_slice()).into())]))?;
 
-    let _ = JsFuture::from(ctx.resume()?).await;
+    // Covers browsers that let the context start but not before the first
+    // `await` above; if this is refused too, the splash asks for another tap.
+    let _ = ctx.resume();
 
     AUDIO.with_borrow_mut(|a| {
         *a = Some(Audio {
@@ -193,6 +269,7 @@ async fn start_inner(patch: Vec<f32>, volume: f32, mut status: Signal<AudioStatu
             analyser_mix,
             _node: node,
             _on_message: on_message,
+            _on_state: on_state,
         })
     });
     Ok(())

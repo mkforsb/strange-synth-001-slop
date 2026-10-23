@@ -27,6 +27,7 @@ fn main() {
 fn App() -> Element {
     let st = use_context_provider(AppState::new);
     use_hook(move || install_computer_keyboard(st));
+    use_hook(audio::install_gesture_resume);
     let status = (st.status)();
     let started = matches!(status, AudioStatus::Running { .. });
 
@@ -57,6 +58,7 @@ fn Splash(status: AudioStatus) -> Element {
     let n_presets = st.presets.read().len();
     let (label, detail) = match &status {
         AudioStatus::Starting => ("WAKING…", String::new()),
+        AudioStatus::Suspended => ("TAP TO START AUDIO", "the browser is holding audio paused".into()),
         AudioStatus::Failed(e) => ("TRY AGAIN", format!("audio failed: {e}")),
         _ => ("AWAKEN THE MACHINE", String::new()),
     };
@@ -70,7 +72,8 @@ fn Splash(status: AudioStatus) -> Element {
                     onclick: move |_| {
                         let patch = st.patch().to_vec();
                         let vol = *st.volume.peek();
-                        spawn(audio::start(patch, vol * vol, st.status));
+                        // Synchronously, inside the gesture: see `audio::start`.
+                        audio::start(patch, vol * vol, st.status);
                     },
                     "{label}"
                 }

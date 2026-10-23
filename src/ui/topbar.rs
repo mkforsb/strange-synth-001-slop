@@ -27,6 +27,7 @@ pub fn TopBar() -> Element {
     let status = match (st.status)() {
         AudioStatus::Running { sample_rate } => format!("{:.1} kHz", sample_rate / 1000.0),
         AudioStatus::Starting => "booting…".into(),
+        AudioStatus::Suspended => "audio paused · tap to resume".into(),
         AudioStatus::Failed(e) => format!("audio failed: {e}"),
         AudioStatus::Off => "audio off".into(),
     };

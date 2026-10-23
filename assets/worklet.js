@@ -1,29 +1,26 @@
 // AudioWorklet processor: hosts the Rust DSP engine (a bare wasm module with
 // no imports) on the audio thread. Loaded from a Blob URL by the app.
 //
-// main → worklet: {t:'wasm', bytes} {t:'p', i, v} {t:'patch', values}
+// The main thread compiles the module and passes it in processorOptions.module;
+// it is instantiated synchronously here, so nothing waits on promise jobs in
+// the worklet scope.
+//
+// main → worklet: {t:'p', i, v} {t:'patch', values}
 //                 {t:'on', n, v} {t:'off', n} {t:'alloff'} {t:'panic'}
-// worklet → main: {t:'ready'} {t:'tel', data} {t:'error', msg}
+// worklet → main: {t:'ready', sampleRate} {t:'tel', data} {t:'error', msg}
 
 const TELEMETRY_EVERY = 1536; // samples between telemetry posts (~31 Hz @ 48k)
 
 class StrangeAttractorProcessor extends AudioWorkletProcessor {
-  constructor() {
+  constructor(options) {
     super();
     this.ex = null;
-    this.queue = [];
     this.mem = null;
     this.telCountdown = 0;
     this.port.onmessage = (e) => this.onMessage(e.data);
-  }
-
-  async boot(bytes) {
     try {
-      const { instance } = await WebAssembly.instantiate(bytes, {});
-      this.ex = instance.exports;
+      this.ex = new WebAssembly.Instance(options.processorOptions.module, {}).exports;
       this.ex.sa_init(sampleRate);
-      for (const m of this.queue) this.handle(m);
-      this.queue = [];
       this.port.postMessage({ t: 'ready', sampleRate });
     } catch (err) {
       this.port.postMessage({ t: 'error', msg: String(err) });
@@ -31,9 +28,7 @@ class StrangeAttractorProcessor extends AudioWorkletProcessor {
   }
 
   onMessage(m) {
-    if (m.t === 'wasm') this.boot(m.bytes);
-    else if (!this.ex) this.queue.push(m);
-    else this.handle(m);
+    if (this.ex) this.handle(m);
   }
 
   handle(m) {
