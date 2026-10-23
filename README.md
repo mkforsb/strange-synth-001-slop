@@ -20,8 +20,12 @@ resonator, glitch/crush mangling, and a master chain of a **Moog ladder**
 rustup target add wasm32-unknown-unknown
 cargo install dioxus-cli        # or: cargo binstall dioxus-cli  (dx 0.7)
 dx serve --platform web         # dev server with hot reload
-dx bundle --platform web --release   # static build → target/dx/strange-attractor/release/web/public
+make web                        # static build → target/dx/strange-attractor/release/web/public
 ```
+
+`make web` runs `dx bundle --platform web --release`, then `tools/relative_paths.py`
+rewrites dx's absolute `/assets/...` URLs to relative ones so the build can be
+hosted from any directory (dx's `base_path` can't express that).
 
 Click **AWAKEN THE MACHINE** (browsers only allow audio after a gesture), then play.
 
@@ -108,7 +112,7 @@ cargo test -p sa-engine --release                       # curves, filters, rever
 cargo run --release -p sa-engine --example presets      # level/CPU per preset (WAV_DIR=dir to write WAVs)
 cargo run --release -p sa-engine --example probe -- Bow=1 Strike=0   # one-off parameter probes
 cargo run --release -p sa-engine --example stress       # worst-case CPU, 8 voices, everything on
-# browser tests (Playwright + Chromium), after `dx bundle --platform web --release`:
+# browser tests (Playwright + Chromium), after `make web`:
 python3 tools/ui_test.py      target/dx/strange-attractor/release/web/public
 python3 tools/preset_sweep.py target/dx/strange-attractor/release/web/public
 ```
